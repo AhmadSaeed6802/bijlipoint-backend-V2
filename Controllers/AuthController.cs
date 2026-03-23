@@ -28,19 +28,15 @@ namespace BijliPoint.Controllers
         [HttpPost("register")]
         public async Task<IActionResult> Register([FromBody] RegisterRequest request)
         {
-            // Validate CNIC format
             if (string.IsNullOrEmpty(request.CNIC) || request.CNIC.Length < 13)
                 return BadRequest(new { error = "CNIC is required (13-15 digits)" });
 
-            // Check if email exists
             if (_context.Users.Any(u => u.Email == request.Email))
                 return BadRequest(new { error = "Email already registered" });
 
-            // Check if phone exists
             if (_context.Users.Any(u => u.Phone == request.Phone))
                 return BadRequest(new { error = "Phone number already registered" });
 
-            // Check if CNIC exists
             if (_context.Users.Any(u => u.CNIC == request.CNIC))
                 return BadRequest(new { error = "CNIC already registered" });
 
@@ -49,8 +45,8 @@ namespace BijliPoint.Controllers
                 Name = request.Name,
                 Email = request.Email,
                 Phone = request.Phone,
-                CNIC = request.CNIC,  // Required now
-                PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
+                CNIC = request.CNIC,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password, 11),
                 Role = request.Role,
                 CreatedAt = DateTime.UtcNow,
                 IsActive = true
@@ -79,9 +75,6 @@ namespace BijliPoint.Controllers
         [HttpPost("login")]
         public IActionResult Login([FromBody] LoginRequest request)
         {
-            string hashed = BCrypt.Net.BCrypt.HashPassword("admin123");
-            Console.WriteLine(hashed);
-
             var user = _context.Users.FirstOrDefault(u => u.Email == request.Email);
 
             if (user == null || !BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
@@ -164,7 +157,7 @@ namespace BijliPoint.Controllers
                 return BadRequest(new { error = "Invalid or expired token" });
 
             var user = await _context.Users.FindAsync(tokenRecord.UserId);
-            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.NewPassword);
+            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.NewPassword, 11);
             tokenRecord.IsUsed = true;
 
             await _context.SaveChangesAsync();
