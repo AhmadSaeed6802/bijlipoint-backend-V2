@@ -1,8 +1,9 @@
-using Microsoft.EntityFrameworkCore;
+using BijliPoint.Data;
+using BijliPoint.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
-using BijliPoint.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -46,6 +47,15 @@ builder.Services.AddCors(options =>
         .AllowCredentials();
     });
 });
+
+
+
+#region custome services
+
+// Register memory cache
+builder.Services.AddMemoryCache();
+builder.Services.AddHostedService<MqttService>();
+#endregion
 
 var app = builder.Build();
 

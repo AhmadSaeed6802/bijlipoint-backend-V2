@@ -14,6 +14,8 @@ namespace BijliPoint.Data
         public DbSet<Station> Stations { get; set; }
         public DbSet<ChargingSession> ChargingSessions { get; set; }
         public DbSet<PasswordResetToken> PasswordResetTokens { get; set; }
+        public DbSet<MeterReading> MeterReadings { get; set; }
+        public DbSet<PortCommand> PortCommands { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {

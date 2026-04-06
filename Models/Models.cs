@@ -14,24 +14,30 @@ namespace BijliPoint.Models
         public DateTime CreatedAt { get; set; }
     }
 
-    public class Station
-    {
-        public int Id { get; set; }
-        public int OwnerId { get; set; }
-        public string Name { get; set; }
-        public decimal Latitude { get; set; }
-        public decimal Longitude { get; set; }
-        public string Address { get; set; }
-        public decimal RatePerKwh { get; set; }
-        public int TotalPlugs { get; set; }
-        public int AvailablePlugs { get; set; }
-        public bool IsOpen { get; set; }
-        public string OpenTime { get; set; }
-        public string CloseTime { get; set; }
-        public string WhatsAppNumber { get; set; }
-        public bool IsActive { get; set; }
-        public DateTime CreatedAt { get; set; }
-    }
+        public class Station
+        {
+            public int Id { get; set; }
+            public int OwnerId { get; set; }
+            public string Name { get; set; }
+            public decimal Latitude { get; set; }
+            public decimal Longitude { get; set; }
+            public string Address { get; set; }
+            public decimal RatePerKwh { get; set; }
+            public int TotalPlugs { get; set; }
+            public int AvailablePlugs { get; set; }
+            public bool IsOpen { get; set; }
+            public TimeSpan OpenTime { get; set; }
+            public TimeSpan CloseTime { get; set; }
+            public string WhatsAppNumber { get; set; }
+            public bool IsActive { get; set; }
+            public DateTime CreatedAt { get; set; }
+
+            // NEW: Station management
+            public string StationPassword { get; set; }
+            public string ApprovalStatus { get; set; } // Pending, Approved, Rejected
+            public int? ApprovedBy { get; set; }
+            public DateTime? ApprovedAt { get; set; }
+        }
 
     public class ChargingSession
     {
