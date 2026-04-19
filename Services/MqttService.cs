@@ -46,14 +46,13 @@ namespace BijliPoint.Services
             await _mqttClient.ConnectAsync(options, stoppingToken);
             _logger.LogInformation("Connected to MQTT broker at {Host}:{Port}", _config["Mqtt:Host"], _config["Mqtt:Port"]);
 
-            // Subscribe to all station topics
+            // ✅ UPDATED: Subscribe using StationID pattern
             var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
-                .WithTopicFilter("bijlipoint/stations/+/meter")
+                .WithTopicFilter("bijlipoint/stations/+/meter")  // + matches any StationID
                 .Build();
             await _mqttClient.SubscribeAsync(subscribeOptions, stoppingToken);
-            _logger.LogInformation("Subscribed to meter data topics");
+            _logger.LogInformation("Subscribed to: bijlipoint/stations/+/meter");
 
-            // Keep running and publish control commands
             while (!stoppingToken.IsCancellationRequested)
             {
                 await PublishPendingCommands();
@@ -70,49 +69,68 @@ namespace BijliPoint.Services
 
                 _logger.LogInformation($"Received: {topic} -> {payload}");
 
-                // Topic format: bijlipoint/stations/{stationId}/meter
+                // Topic format: bijlipoint/stations/{StationID}{PortPadded}/meter
+                // Example port 01: bijlipoint/stations/LUMS99999999999901/meter
+                // Example port 02: bijlipoint/stations/LUMS99999999999902/meter
                 var parts = topic.Split('/');
                 if (parts.Length < 4) return;
 
-                var stationIdStr = parts[2];
-                if (!int.TryParse(stationIdStr, out int stationId)) return;
+                var topicSegment = parts[2]; // e.g. "LUMS99999999999901"
 
-                // Payload format: <Timestamp,PortNumber,V,I,P,Energy>
-                // Example: 2026-03-28T12:34:56,1,220.5,10.2,2250.0,1.5
+                // Must be 18 chars: 16 StationID + 2 port digits
+                if (topicSegment.Length != 18)
+                {
+                    _logger.LogWarning("Unexpected topic segment length {Len}: {Seg}", topicSegment.Length, topicSegment);
+                    return;
+                }
+
+                var stationID = topicSegment.Substring(0, 16); // "LUMS999999999999"
+                var portStr   = topicSegment.Substring(16, 2); // "01"
+
+                if (!int.TryParse(portStr, out int portNumber) || portNumber < 1 || portNumber > 3)
+                {
+                    _logger.LogWarning("Invalid port in topic: {Port}", portStr);
+                    return;
+                }
+
+                using var scope = _serviceProvider.CreateScope();
+                var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+                var station = await context.Stations
+                    .FirstOrDefaultAsync(s => s.StationID == stationID && s.ApprovalStatus == "Approved");
+
+                if (station == null)
+                {
+                    _logger.LogWarning("Ignored: unregistered or unapproved station {StationID}", stationID);
+                    return;
+                }
+
+                // Payload format: Timestamp,Voltage,Current,Power,Energy  (port is now in topic)
+                // Example: 2026-04-20T12:00:00,220.5,10.2,2250.0,1.5
                 var data = payload.Split(',');
-                if (data.Length < 6) return;
+                if (data.Length < 5) return;
 
                 var reading = new MeterReading
                 {
-                    StationId = stationId,
-                    PortNumber = int.Parse(data[1]),
-                    Timestamp = DateTime.Parse(data[0]),
-                    Voltage = decimal.Parse(data[2]),
-                    Current = decimal.Parse(data[3]),
-                    Power = decimal.Parse(data[4]),
-                    Energy = decimal.Parse(data[5]),
+                    StationId  = station.Id,
+                    PortNumber = portNumber,
+                    Timestamp  = DateTime.Parse(data[0]),
+                    Voltage    = decimal.Parse(data[1]),
+                    Current    = decimal.Parse(data[2]),
+                    Power      = decimal.Parse(data[3]),
+                    Energy     = decimal.Parse(data[4]),
                     ReceivedAt = DateTime.UtcNow
                 };
 
-                // Store in database
-                // SMART STORAGE: Skip duplicate idle data
                 if (ShouldStoreReading(reading))
                 {
-                    using var scope = _serviceProvider.CreateScope();
-                    var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
                     context.MeterReadings.Add(reading);
                     await context.SaveChangesAsync();
 
-                    _logger.LogInformation("Stored: Station {0} Port {1} - {2}A {3}W",
-                        stationId, reading.PortNumber, reading.Current, reading.Power);
-                }
-                else
-                {
-                    _logger.LogDebug("Skipped idle: Station {0} Port {1}", stationId, reading.PortNumber);
+                    _logger.LogInformation("Stored: StationID {0} (DB ID {1}) Port {2} - {3}A {4}W",
+                        stationID, station.Id, reading.PortNumber, reading.Current, reading.Power);
                 }
 
-
-                // Maintain cached list of ports for this station
                 var portsKey = $"meter:ports:{reading.StationId}";
                 var ports = _cache.GetOrCreate(portsKey, entry => new HashSet<int>());
                 ports.Add(reading.PortNumber);
@@ -126,7 +144,7 @@ namespace BijliPoint.Services
 
         private bool ShouldStoreReading(MeterReading reading)
         {
-           
+
             var cacheKey = $"meter:last:{reading.StationId}:{reading.PortNumber}";
 
 
@@ -144,14 +162,15 @@ namespace BijliPoint.Services
                      Math.Abs(reading.Voltage - lastReading.Voltage) <= 5 &&
                     reading.Energy == lastReading.Energy)
                 {
-                    return false; // Skip duplicate idle data
+                    // Still refresh ReceivedAt so stale detection knows hardware is alive
+                    lastReading.ReceivedAt = reading.ReceivedAt;
+                    _cache.Set(cacheKey, lastReading, TimeSpan.FromMinutes(10));
+                    return false; // Skip duplicate idle data — don't write to DB
                 }
             }
 
-            // Store this reading in cache for next comparison
             _cache.Set(cacheKey, reading, TimeSpan.FromMinutes(10));
-
-            return true; // Store to database
+            return true;
         }
 
         private async Task PublishPendingCommands()
@@ -162,14 +181,17 @@ namespace BijliPoint.Services
                 var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
                 var pending = await context.PortCommands
+                    .Include(c => c.Station)  // ✅ Include Station to get StationID
                     .Where(c => c.Status == "Pending")
                     .OrderBy(c => c.RequestedAt)
                     .ToListAsync();
 
                 foreach (var cmd in pending)
                 {
-                    // Topic: bijlipoint/stations/{stationId}/control/{portNumber}
-                    var topic = $"bijlipoint/stations/{cmd.StationId}/control/{cmd.PortNumber}";
+                    // Control topic: bijlipoint/stations/{StationID}{PortPadded}/control
+                    // Example: bijlipoint/stations/LUMS99999999999901/control
+                    var paddedPort = cmd.PortNumber.ToString("D2");
+                    var topic = $"bijlipoint/stations/{cmd.Station.StationID}{paddedPort}/control";
                     var payload = cmd.Command; // "ON" or "OFF"
 
                     var message = new MqttApplicationMessageBuilder()

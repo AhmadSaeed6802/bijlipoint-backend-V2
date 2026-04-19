@@ -104,7 +104,7 @@ namespace BijliPoint.Controllers
             return Ok(new
             {
                 commandId = command.Id,
-                message = $"Command {request.Command} sent to Station {request.StationId}, Port {request.PortNumber}"
+                message = $"Command {request.Command} sent to Station {station.StationID}, Port {request.PortNumber:D2}"
             });
         }
 

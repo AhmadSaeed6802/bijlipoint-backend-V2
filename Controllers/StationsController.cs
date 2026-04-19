@@ -16,13 +16,23 @@ namespace BijliPoint.Controllers
             _context = context;
         }
 
-        // POST: api/stations/register
         [HttpPost("register")]
         public async Task<IActionResult> RegisterStation([FromBody] StationRegistrationRequest request)
         {
-            // Validate
+            if (string.IsNullOrEmpty(request.StationID))
+                return BadRequest(new { error = "StationID is required (e.g., LUMS123456789101)" });
+
+            if (request.StationID.Length != 16)
+                return BadRequest(new { error = "StationID must be exactly 16 characters: 4-letter name + 12-digit MAC (e.g., LUMS123456789101)" });
+
+            if (await _context.Stations.AnyAsync(s => s.StationID == request.StationID.ToUpper()))
+                return BadRequest(new { error = "This StationID already exists. Please use a unique ID." });
+
+            // Validate password
             if (string.IsNullOrEmpty(request.StationPassword) || request.StationPassword.Length < 6)
+            {
                 return BadRequest(new { error = "Station password must be at least 6 characters" });
+            }
 
             var station = new Station
             {
@@ -32,20 +42,21 @@ namespace BijliPoint.Controllers
                 Longitude = request.Longitude,
                 Address = request.Address,
                 RatePerKwh = request.RatePerKwh,
+                
+                // ✅ NEW: Store StationID
+                StationID = request.StationID.ToUpper(),
+                
                 TotalPlugs = request.TotalPlugs,
                 AvailablePlugs = request.TotalPlugs,
                 IsOpen = true,
                 OpenTime = string.IsNullOrEmpty(request.OpenTime)
                     ? TimeSpan.Parse("00:00")
                     : TimeSpan.Parse(request.OpenTime),
-
                 CloseTime = string.IsNullOrEmpty(request.CloseTime)
                     ? TimeSpan.Parse("23:59")
                     : TimeSpan.Parse(request.CloseTime),
-                //OpenTime = request.OpenTime ?? "00:00",
-                //CloseTime = request.CloseTime ?? "23:59",
                 WhatsAppNumber = request.WhatsAppNumber,
-                IsActive = false, // Inactive until approved
+                IsActive = false,
                 StationPassword = BCrypt.Net.BCrypt.HashPassword(request.StationPassword),
                 ApprovalStatus = "Pending",
                 CreatedAt = DateTime.UtcNow
@@ -56,12 +67,12 @@ namespace BijliPoint.Controllers
 
             return Ok(new
             {
-                stationId = station.Id,
-                message = "Station registration submitted. Waiting for admin approval."
+                id = station.Id,
+                stationID = station.StationID,
+                message = $"Station registered with ID: {station.StationID}. Waiting for admin approval."
             });
         }
 
-        // GET: api/stations/my-stations/{ownerId}
         [HttpGet("my-stations/{ownerId}")]
         public async Task<IActionResult> GetMyStations(int ownerId)
         {
@@ -72,6 +83,7 @@ namespace BijliPoint.Controllers
                     s.Id,
                     s.Name,
                     s.Address,
+                    s.StationID,  // ✅ NEW: Include StationID
                     s.TotalPlugs,
                     s.RatePerKwh,
                     s.ApprovalStatus,
@@ -84,7 +96,6 @@ namespace BijliPoint.Controllers
             return Ok(stations);
         }
 
-        // POST: api/stations/verify-access
         [HttpPost("verify-access")]
         public async Task<IActionResult> VerifyStationAccess([FromBody] StationAccessRequest request)
         {
@@ -101,25 +112,25 @@ namespace BijliPoint.Controllers
 
             return Ok(new
             {
-                stationId = station.Id,
+                id = station.Id,
+                stationID = station.StationID,
                 name = station.Name,
                 totalPlugs = station.TotalPlugs,
                 message = "Access granted"
             });
         }
 
-        // GET: api/stations/pending (Admin only)
         [HttpGet("pending")]
         public async Task<IActionResult> GetPendingStations()
         {
             var pending = await _context.Stations
                 .Where(s => s.ApprovalStatus == "Pending")
-                //.Include(s => s.Name) // Optional: include owner details
                 .Select(s => new
                 {
                     s.Id,
                     s.Name,
                     s.Address,
+                    s.StationID,  // ✅ NEW: Include StationID
                     s.TotalPlugs,
                     s.RatePerKwh,
                     s.OwnerId,
@@ -131,7 +142,6 @@ namespace BijliPoint.Controllers
             return Ok(pending);
         }
 
-        // POST: api/stations/approve
         [HttpPost("approve")]
         public async Task<IActionResult> ApproveStation([FromBody] ApprovalRequest request)
         {
@@ -150,11 +160,22 @@ namespace BijliPoint.Controllers
             return Ok(new
             {
                 message = request.Approve ? "Station approved" : "Station rejected",
-                stationId = station.Id
+                id = station.Id,
+                stationID = station.StationID
             });
         }
 
-        // GET: api/stations/details/{stationId}
+        [HttpGet("stats")]
+        public async Task<IActionResult> GetStats()
+        {
+            var totalApproved = await _context.Stations.CountAsync(s => s.ApprovalStatus == "Approved");
+            var totalPending = await _context.Stations.CountAsync(s => s.ApprovalStatus == "Pending");
+            var totalRiders = await _context.Users.CountAsync(u => u.Role == "Rider" && u.IsActive);
+            var totalOwners = await _context.Users.CountAsync(u => u.Role == "StationOwner" && u.IsActive);
+
+            return Ok(new { totalApproved, totalPending, totalRiders, totalOwners });
+        }
+
         [HttpGet("details/{stationId}")]
         public async Task<IActionResult> GetStationDetails(int stationId)
         {
@@ -170,6 +191,7 @@ namespace BijliPoint.Controllers
                 station.Address,
                 station.Latitude,
                 station.Longitude,
+                station.StationID,  // ✅ NEW: Include StationID
                 station.TotalPlugs,
                 station.AvailablePlugs,
                 station.RatePerKwh,
@@ -191,6 +213,7 @@ namespace BijliPoint.Controllers
         public decimal Longitude { get; set; }
         public string Address { get; set; }
         public decimal RatePerKwh { get; set; }
+        public string StationID { get; set; }  // ✅ NEW: StationID (12 chars)
         public int TotalPlugs { get; set; }
         public string OpenTime { get; set; }
         public string CloseTime { get; set; }
