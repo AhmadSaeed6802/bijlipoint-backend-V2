@@ -12,9 +12,10 @@ namespace BijliPoint.Services
         private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<MqttService> _logger;
         private readonly IConfiguration _config;
-        private IMqttClient _mqttClient;
         private readonly IMemoryCache _cache;
-
+        private IMqttClient _mqttClient;
+        private MqttClientOptions _options;
+        private MqttClientSubscribeOptions _subscribeOptions;
 
         public MqttService(IServiceProvider serviceProvider, ILogger<MqttService> logger, IConfiguration config, IMemoryCache cache)
         {
@@ -29,34 +30,48 @@ namespace BijliPoint.Services
             var factory = new MqttFactory();
             _mqttClient = factory.CreateMqttClient();
 
-            var options = new MqttClientOptionsBuilder()
-                .WithTcpServer(_config["Mqtt:Host"], int.Parse(_config["Mqtt:Port"])) // Mosquitto on same VPS
+            _options = new MqttClientOptionsBuilder()
+                .WithTcpServer(_config["Mqtt:Host"], int.Parse(_config["Mqtt:Port"]))
                 .WithCredentials(_config["Mqtt:Username"], _config["Mqtt:Password"])
                 .WithClientId("BijliPointBackend")
                 .WithCleanSession()
                 .Build();
 
-            // Handle incoming messages
-            _mqttClient.ApplicationMessageReceivedAsync += async e =>
+            _subscribeOptions = new MqttClientSubscribeOptionsBuilder()
+                .WithTopicFilter("bijlipoint/stations/+/meter")
+                .Build();
+
+            _mqttClient.ApplicationMessageReceivedAsync += async e => await HandleMessage(e);
+
+            // Auto-reconnect on any drop
+            _mqttClient.DisconnectedAsync += async e =>
             {
-                await HandleMessage(e);
+                _logger.LogWarning("MQTT disconnected. Reconnecting in 5s...");
+                await Task.Delay(5000);
+                await ConnectAndSubscribe();
             };
 
-            // Connect
-            await _mqttClient.ConnectAsync(options, stoppingToken);
-            _logger.LogInformation("Connected to MQTT broker at {Host}:{Port}", _config["Mqtt:Host"], _config["Mqtt:Port"]);
-
-            // ✅ UPDATED: Subscribe using StationID pattern
-            var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
-                .WithTopicFilter("bijlipoint/stations/+/meter")  // + matches any StationID
-                .Build();
-            await _mqttClient.SubscribeAsync(subscribeOptions, stoppingToken);
-            _logger.LogInformation("Subscribed to: bijlipoint/stations/+/meter");
+            await ConnectAndSubscribe();
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 await PublishPendingCommands();
-                await Task.Delay(1000, stoppingToken); // Check every second
+                await Task.Delay(1000, stoppingToken);
+            }
+        }
+
+        private async Task ConnectAndSubscribe()
+        {
+            try
+            {
+                await _mqttClient.ConnectAsync(_options, CancellationToken.None);
+                _logger.LogInformation("Connected to MQTT broker at {Host}:{Port}", _config["Mqtt:Host"], _config["Mqtt:Port"]);
+                await _mqttClient.SubscribeAsync(_subscribeOptions, CancellationToken.None);
+                _logger.LogInformation("Subscribed to: bijlipoint/stations/+/meter");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("MQTT connect failed: {Msg}", ex.Message);
             }
         }
 
@@ -64,28 +79,24 @@ namespace BijliPoint.Services
         {
             try
             {
-                var topic = e.ApplicationMessage.Topic;
+                var topic   = e.ApplicationMessage.Topic;
                 var payload = System.Text.Encoding.UTF8.GetString(e.ApplicationMessage.Payload);
 
-                _logger.LogInformation($"Received: {topic} -> {payload}");
+                _logger.LogInformation("Received: {Topic} -> {Payload}", topic, payload);
 
-                // Topic format: bijlipoint/stations/{StationID}{PortPadded}/meter
-                // Example port 01: bijlipoint/stations/LUMS99999999999901/meter
-                // Example port 02: bijlipoint/stations/LUMS99999999999902/meter
+                // Topic: bijlipoint/stations/{StationID16}{Port2}/meter  → segment = 18 chars
                 var parts = topic.Split('/');
                 if (parts.Length < 4) return;
 
-                var topicSegment = parts[2]; // e.g. "LUMS99999999999901"
-
-                // Must be 18 chars: 16 StationID + 2 port digits
-                if (topicSegment.Length != 18)
+                var seg = parts[2];
+                if (seg.Length != 18)
                 {
-                    _logger.LogWarning("Unexpected topic segment length {Len}: {Seg}", topicSegment.Length, topicSegment);
+                    _logger.LogWarning("Unexpected topic segment length {Len}: {Seg}", seg.Length, seg);
                     return;
                 }
 
-                var stationID = topicSegment.Substring(0, 16); // "LUMS999999999999"
-                var portStr   = topicSegment.Substring(16, 2); // "01"
+                var stationID = seg.Substring(0, 16);
+                var portStr   = seg.Substring(16, 2);
 
                 if (!int.TryParse(portStr, out int portNumber) || portNumber < 1 || portNumber > 3)
                 {
@@ -93,8 +104,8 @@ namespace BijliPoint.Services
                     return;
                 }
 
-                using var scope = _serviceProvider.CreateScope();
-                var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+                using var scope   = _serviceProvider.CreateScope();
+                var context       = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
                 var station = await context.Stations
                     .FirstOrDefaultAsync(s => s.StationID == stationID && s.ApprovalStatus == "Approved");
@@ -105,8 +116,7 @@ namespace BijliPoint.Services
                     return;
                 }
 
-                // Payload format: Timestamp,Voltage,Current,Power,Energy  (port is now in topic)
-                // Example: 2026-04-20T12:00:00,220.5,10.2,2250.0,1.5
+                // Payload: Timestamp,Voltage,Current,Power,Energy
                 var data = payload.Split(',');
                 if (data.Length < 5) return;
 
@@ -114,7 +124,7 @@ namespace BijliPoint.Services
                 {
                     StationId  = station.Id,
                     PortNumber = portNumber,
-                    Timestamp  = DateTime.Parse(data[0]),
+                    Timestamp  = DateTime.SpecifyKind(DateTime.Parse(data[0]), DateTimeKind.Utc),
                     Voltage    = decimal.Parse(data[1]),
                     Current    = decimal.Parse(data[2]),
                     Power      = decimal.Parse(data[3]),
@@ -126,46 +136,39 @@ namespace BijliPoint.Services
                 {
                     context.MeterReadings.Add(reading);
                     await context.SaveChangesAsync();
-
-                    _logger.LogInformation("Stored: StationID {0} (DB ID {1}) Port {2} - {3}A {4}W",
-                        stationID, station.Id, reading.PortNumber, reading.Current, reading.Power);
+                    _logger.LogInformation("Stored: StationID {SID} (DB ID {DbId}) Port {Port} - {A}A {W}W",
+                        stationID, station.Id, portNumber, reading.Current, reading.Power);
                 }
 
+                // Keep port list in cache for the latest-readings endpoint
                 var portsKey = $"meter:ports:{reading.StationId}";
-                var ports = _cache.GetOrCreate(portsKey, entry => new HashSet<int>());
+                var ports    = _cache.GetOrCreate(portsKey, _ => new HashSet<int>());
                 ports.Add(reading.PortNumber);
                 _cache.Set(portsKey, ports, TimeSpan.FromHours(1));
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Error handling message: {ex.Message}");
+                _logger.LogError("Error handling message: {Msg}", ex.Message);
             }
         }
 
         private bool ShouldStoreReading(MeterReading reading)
         {
-
             var cacheKey = $"meter:last:{reading.StationId}:{reading.PortNumber}";
 
-
-            // Get last stored reading from cache
-            if (_cache.TryGetValue(cacheKey, out MeterReading lastReading))
+            if (_cache.TryGetValue(cacheKey, out MeterReading last))
             {
-                // Is this reading idle? (no current flowing) with tolerance
-                bool isIdle = reading.Current <= 0.01m && reading.Power <= 0.5m;
+                bool isIdle  = reading.Current <= 0.01m && reading.Power <= 0.5m;
+                bool wasIdle = last.Current    <= 0.01m && last.Power    <= 0.5m;
 
-                // Was last reading also idle?
-                bool wasIdle = lastReading.Current <= 0.01m && lastReading.Power <= 0.5m;
-
-                // Skip if: both idle AND values unchanged (within tolerance)
                 if (isIdle && wasIdle &&
-                     Math.Abs(reading.Voltage - lastReading.Voltage) <= 5 &&
-                    reading.Energy == lastReading.Energy)
+                    Math.Abs(reading.Voltage - last.Voltage) <= 5 &&
+                    reading.Energy == last.Energy)
                 {
-                    // Still refresh ReceivedAt so stale detection knows hardware is alive
-                    lastReading.ReceivedAt = reading.ReceivedAt;
-                    _cache.Set(cacheKey, lastReading, TimeSpan.FromMinutes(10));
-                    return false; // Skip duplicate idle data — don't write to DB
+                    // Keep ReceivedAt fresh so stale detection stays accurate
+                    last.ReceivedAt = reading.ReceivedAt;
+                    _cache.Set(cacheKey, last, TimeSpan.FromMinutes(10));
+                    return false;
                 }
             }
 
@@ -175,49 +178,46 @@ namespace BijliPoint.Services
 
         private async Task PublishPendingCommands()
         {
+            if (!_mqttClient.IsConnected) return;
             try
             {
                 using var scope = _serviceProvider.CreateScope();
-                var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+                var context     = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
                 var pending = await context.PortCommands
-                    .Include(c => c.Station)  // ✅ Include Station to get StationID
+                    .Include(c => c.Station)
                     .Where(c => c.Status == "Pending")
                     .OrderBy(c => c.RequestedAt)
                     .ToListAsync();
 
                 foreach (var cmd in pending)
                 {
-                    // Control topic: bijlipoint/stations/{StationID}{PortPadded}/control
-                    // Example: bijlipoint/stations/LUMS99999999999901/control
-                    var paddedPort = cmd.PortNumber.ToString("D2");
-                    var topic = $"bijlipoint/stations/{cmd.Station.StationID}{paddedPort}/control";
-                    var payload = cmd.Command; // "ON" or "OFF"
+                    var topic = $"bijlipoint/stations/{cmd.Station.StationID}{cmd.PortNumber:D2}/control";
 
                     var message = new MqttApplicationMessageBuilder()
                         .WithTopic(topic)
-                        .WithPayload(payload)
+                        .WithPayload(cmd.Command)
                         .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
                         .Build();
 
                     await _mqttClient.PublishAsync(message);
 
-                    cmd.Status = "Executed";
+                    cmd.Status    = "Executed";
                     cmd.ExecutedAt = DateTime.UtcNow;
                     await context.SaveChangesAsync();
 
-                    _logger.LogInformation($"Published command: {topic} -> {payload}");
+                    _logger.LogInformation("Published command: {Topic} -> {Cmd}", topic, cmd.Command);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Error publishing commands: {ex.Message}");
+                _logger.LogError("Error publishing commands: {Msg}", ex.Message);
             }
         }
 
         public override async Task StopAsync(CancellationToken cancellationToken)
         {
-            if (_mqttClient != null)
+            if (_mqttClient?.IsConnected == true)
             {
                 await _mqttClient.DisconnectAsync();
                 _logger.LogInformation("Disconnected from MQTT broker");

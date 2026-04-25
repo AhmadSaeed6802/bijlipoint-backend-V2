@@ -55,13 +55,11 @@ namespace BijliPoint.Controllers
                 {
                     var cacheKey = $"meter:last:{stationId}:{port}";
                     if (_cache.TryGetValue(cacheKey, out MeterReading cached))
-                    {
                         results.Add(cached);
-                    }
                 }
             }
 
-            // Fallback to DB if cache empty
+            // Fallback to DB if cache empty (e.g. after service restart)
             if (results.Count == 0)
             {
                 results = await _context.MeterReadings
@@ -71,7 +69,18 @@ namespace BijliPoint.Controllers
                     .ToListAsync();
             }
 
-            return Ok(results);
+            // Never expose station or any sensitive fields — return meter data only
+            var safe = results.Select(r => new
+            {
+                r.PortNumber,
+                r.Voltage,
+                r.Current,
+                r.Power,
+                r.Energy,
+                ReceivedAt = DateTime.SpecifyKind(r.ReceivedAt, DateTimeKind.Utc)
+            });
+
+            return Ok(safe);
         }
 
 
