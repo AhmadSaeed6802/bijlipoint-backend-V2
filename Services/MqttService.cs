@@ -33,7 +33,7 @@ namespace BijliPoint.Services
             _options = new MqttClientOptionsBuilder()
                 .WithTcpServer(_config["Mqtt:Host"], int.Parse(_config["Mqtt:Port"]))
                 .WithCredentials(_config["Mqtt:Username"], _config["Mqtt:Password"])
-                .WithClientId("BijliPointBackend")
+                .WithClientId($"{_config["Mqtt:ClientPrefix"] ?? "BP"}-{Environment.MachineName}")
                 .WithCleanSession()
                 .Build();
 
