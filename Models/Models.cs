@@ -47,8 +47,10 @@ namespace BijliPoint.Models
         public int Id { get; set; }
         public int RiderId { get; set; }
         public int StationId { get; set; }
+        public int PortNumber { get; set; }
         public DateTime StartTime { get; set; }
         public DateTime? EndTime { get; set; }
+        public decimal EnergyAtStart { get; set; }
         public decimal UnitsConsumed { get; set; }
         public decimal TotalCost { get; set; }
         public string Status { get; set; } // Active, Completed, Cancelled

@@ -53,9 +53,11 @@ namespace BijliPoint.Services
 
             await ConnectAndSubscribe();
 
+            int tick = 0;
             while (!stoppingToken.IsCancellationRequested)
             {
                 await PublishPendingCommands();
+                if (++tick % 30 == 0) await CheckSessionHealth(); // every 30 s
                 await Task.Delay(1000, stoppingToken);
             }
         }
@@ -212,6 +214,78 @@ namespace BijliPoint.Services
             catch (Exception ex)
             {
                 _logger.LogError("Error publishing commands: {Msg}", ex.Message);
+            }
+        }
+
+        private async Task CheckSessionHealth()
+        {
+            try
+            {
+                using var scope   = _serviceProvider.CreateScope();
+                var context       = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+                var active = await context.ChargingSessions
+                    .Where(s => s.Status == "Active")
+                    .ToListAsync();
+
+                if (!active.Any()) return;
+
+                bool changed = false;
+
+                foreach (var session in active)
+                {
+                    var cacheKey = $"meter:last:{session.StationId}:{session.PortNumber}";
+                    _cache.TryGetValue(cacheKey, out MeterReading last);
+
+                    // ── Stale: no signal for > 5 minutes ──────────────────────────────
+                    if (last == null || (DateTime.UtcNow - last.ReceivedAt).TotalMinutes > 5)
+                    {
+                        var station = await context.Stations.FindAsync(session.StationId);
+                        decimal energy = last != null ? Math.Max(0, last.Energy - session.EnergyAtStart) : 0;
+                        session.Status        = "Timeout";
+                        session.EndTime       = DateTime.UtcNow;
+                        session.UnitsConsumed = energy;
+                        session.TotalCost     = Math.Round(energy * (station?.RatePerKwh ?? 18m), 2);
+                        _cache.Remove($"session:idle:{session.StationId}:{session.PortNumber}");
+                        changed = true;
+                        _logger.LogWarning("Session {Id} → Timeout (no signal >5min)", session.Id);
+                        continue;
+                    }
+
+                    // ── Idle: current below threshold ──────────────────────────────────
+                    bool isIdle  = last.Current < 0.3m;
+                    var idleKey  = $"session:idle:{session.StationId}:{session.PortNumber}";
+
+                    if (isIdle)
+                    {
+                        if (!_cache.TryGetValue(idleKey, out DateTime idleSince))
+                        {
+                            _cache.Set(idleKey, DateTime.UtcNow, TimeSpan.FromMinutes(10));
+                        }
+                        else if ((DateTime.UtcNow - idleSince).TotalSeconds >= 60)
+                        {
+                            var station = await context.Stations.FindAsync(session.StationId);
+                            decimal energy = Math.Max(0, last.Energy - session.EnergyAtStart);
+                            session.Status        = "AutoCompleted";
+                            session.EndTime       = DateTime.UtcNow;
+                            session.UnitsConsumed = energy;
+                            session.TotalCost     = Math.Round(energy * (station?.RatePerKwh ?? 18m), 2);
+                            _cache.Remove(idleKey);
+                            changed = true;
+                            _logger.LogInformation("Session {Id} → AutoCompleted (idle >60s)", session.Id);
+                        }
+                    }
+                    else
+                    {
+                        _cache.Remove(idleKey); // current flowing — reset idle timer
+                    }
+                }
+
+                if (changed) await context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("CheckSessionHealth error: {Msg}", ex.Message);
             }
         }
 

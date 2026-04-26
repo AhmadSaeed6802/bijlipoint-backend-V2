@@ -176,6 +176,32 @@ namespace BijliPoint.Controllers
             return Ok(new { totalApproved, totalPending, totalRiders, totalOwners });
         }
 
+        // GET: api/stations/approved  — public list for rider station browser
+        [HttpGet("approved")]
+        public async Task<IActionResult> GetApprovedStations()
+        {
+            var stations = await _context.Stations
+                .Where(s => s.ApprovalStatus == "Approved" && s.IsActive)
+                .Select(s => new
+                {
+                    s.Id,
+                    s.Name,
+                    s.Address,
+                    s.Latitude,
+                    s.Longitude,
+                    s.StationID,
+                    s.TotalPlugs,
+                    s.RatePerKwh,
+                    s.OpenTime,
+                    s.CloseTime,
+                    s.WhatsAppNumber
+                })
+                .OrderBy(s => s.Name)
+                .ToListAsync();
+
+            return Ok(stations);
+        }
+
         [HttpGet("details/{stationId}")]
         public async Task<IActionResult> GetStationDetails(int stationId)
         {
