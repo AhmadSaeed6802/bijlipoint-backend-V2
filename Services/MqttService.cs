@@ -77,6 +77,8 @@ namespace BijliPoint.Services
             }
         }
 
+        private const decimal I_CHARGING = 0.3m; // CT clamp noise floor — same as frontend
+
         private async Task HandleMessage(MqttApplicationMessageReceivedEventArgs e)
         {
             try
@@ -134,19 +136,91 @@ namespace BijliPoint.Services
                     ReceivedAt = DateTime.UtcNow
                 };
 
+                bool needsSave = false;
+
                 if (ShouldStoreReading(reading))
                 {
                     context.MeterReadings.Add(reading);
-                    await context.SaveChangesAsync();
-                    _logger.LogInformation("Stored: StationID {SID} (DB ID {DbId}) Port {Port} - {A}A {W}W",
-                        stationID, station.Id, portNumber, reading.Current, reading.Power);
+                    needsSave = true;
+                    _logger.LogInformation("Stored: StationID {SID} Port {Port} - {A}A {W}W",
+                        stationID, portNumber, reading.Current, reading.Power);
                 }
 
-                // Keep port list in cache for the latest-readings endpoint
+                // Update port set in cache
                 var portsKey = $"meter:ports:{reading.StationId}";
                 var ports    = _cache.GetOrCreate(portsKey, _ => new HashSet<int>());
                 ports.Add(reading.PortNumber);
                 _cache.Set(portsKey, ports, TimeSpan.FromHours(1));
+
+                // ── Real-time session management ──────────────────────────────────
+                bool isIdle = reading.Current < I_CHARGING;
+
+                if (isIdle)
+                {
+                    // Any single idle reading during an active session → end immediately.
+                    // This ensures billing stops the instant the charger disconnects,
+                    // and prevents another rider from continuing under the same session.
+                    var active = await context.ChargingSessions
+                        .FirstOrDefaultAsync(s => s.StationId == station.Id
+                                               && s.PortNumber == portNumber
+                                               && s.Status == "Active");
+
+                    if (active != null)
+                    {
+                        decimal energy = Math.Max(0, reading.Energy - active.EnergyAtStart);
+                        active.Status        = "AutoCompleted";
+                        active.EndTime       = DateTime.UtcNow;
+                        active.UnitsConsumed = energy;
+                        active.TotalCost     = Math.Round(energy * station.RatePerKwh, 2);
+                        _cache.Remove($"session:idle:{station.Id}:{portNumber}");
+
+                        // Always send OFF on session end for physical relay assurance
+                        context.PortCommands.Add(new PortCommand
+                        {
+                            StationId   = station.Id,
+                            PortNumber  = portNumber,
+                            Command     = "OFF",
+                            RequestedBy = 0,
+                            RequestedAt = DateTime.UtcNow,
+                            Status      = "Pending"
+                        });
+                        needsSave = true;
+                        _logger.LogInformation("Session {Id} → AutoCompleted (idle reading, Port {P}, {E} kWh)",
+                            active.Id, portNumber, energy);
+                    }
+                }
+                else
+                {
+                    // Charging detected with no active session → unauthorized protection.
+                    // Rate-limited to one OFF per minute per port to avoid command spam.
+                    var unauthKey = $"unauth:off:{station.Id}:{portNumber}";
+                    if (!_cache.TryGetValue(unauthKey, out _))
+                    {
+                        bool hasSession = await context.ChargingSessions
+                            .AnyAsync(s => s.StationId == station.Id
+                                       && s.PortNumber == portNumber
+                                       && s.Status == "Active");
+
+                        if (!hasSession)
+                        {
+                            _cache.Set(unauthKey, true, TimeSpan.FromMinutes(1));
+                            context.PortCommands.Add(new PortCommand
+                            {
+                                StationId   = station.Id,
+                                PortNumber  = portNumber,
+                                Command     = "OFF",
+                                RequestedBy = 0,
+                                RequestedAt = DateTime.UtcNow,
+                                Status      = "Pending"
+                            });
+                            needsSave = true;
+                            _logger.LogWarning("Unauthorized charging: Station {SId} Port {P} → OFF queued",
+                                station.Id, portNumber);
+                        }
+                    }
+                }
+
+                if (needsSave) await context.SaveChangesAsync();
             }
             catch (Exception ex)
             {
@@ -246,38 +320,43 @@ namespace BijliPoint.Services
                         session.EndTime       = DateTime.UtcNow;
                         session.UnitsConsumed = energy;
                         session.TotalCost     = Math.Round(energy * (station?.RatePerKwh ?? 18m), 2);
-                        _cache.Remove($"session:idle:{session.StationId}:{session.PortNumber}");
+                        context.PortCommands.Add(new PortCommand
+                        {
+                            StationId   = session.StationId,
+                            PortNumber  = session.PortNumber,
+                            Command     = "OFF",
+                            RequestedBy = 0,
+                            RequestedAt = DateTime.UtcNow,
+                            Status      = "Pending"
+                        });
                         changed = true;
                         _logger.LogWarning("Session {Id} → Timeout (no signal >5min)", session.Id);
                         continue;
                     }
 
-                    // ── Idle: current below threshold ──────────────────────────────────
-                    bool isIdle  = last.Current < 0.3m;
-                    var idleKey  = $"session:idle:{session.StationId}:{session.PortNumber}";
-
-                    if (isIdle)
+                    // ── Idle catch-all: safety net for sessions started before service restart.
+                    // HandleMessage ends sessions immediately on idle readings; this catches
+                    // any that slipped through (e.g. service restarted mid-session).
+                    if (last.Current < I_CHARGING)
                     {
-                        if (!_cache.TryGetValue(idleKey, out DateTime idleSince))
+                        var station = await context.Stations.FindAsync(session.StationId);
+                        decimal energy = Math.Max(0, last.Energy - session.EnergyAtStart);
+                        session.Status        = "AutoCompleted";
+                        session.EndTime       = DateTime.UtcNow;
+                        session.UnitsConsumed = energy;
+                        session.TotalCost     = Math.Round(energy * (station?.RatePerKwh ?? 18m), 2);
+                        context.PortCommands.Add(new PortCommand
                         {
-                            _cache.Set(idleKey, DateTime.UtcNow, TimeSpan.FromMinutes(10));
-                        }
-                        else if ((DateTime.UtcNow - idleSince).TotalSeconds >= 60)
-                        {
-                            var station = await context.Stations.FindAsync(session.StationId);
-                            decimal energy = Math.Max(0, last.Energy - session.EnergyAtStart);
-                            session.Status        = "AutoCompleted";
-                            session.EndTime       = DateTime.UtcNow;
-                            session.UnitsConsumed = energy;
-                            session.TotalCost     = Math.Round(energy * (station?.RatePerKwh ?? 18m), 2);
-                            _cache.Remove(idleKey);
-                            changed = true;
-                            _logger.LogInformation("Session {Id} → AutoCompleted (idle >60s)", session.Id);
-                        }
-                    }
-                    else
-                    {
-                        _cache.Remove(idleKey); // current flowing — reset idle timer
+                            StationId   = session.StationId,
+                            PortNumber  = session.PortNumber,
+                            Command     = "OFF",
+                            RequestedBy = 0,
+                            RequestedAt = DateTime.UtcNow,
+                            Status      = "Pending"
+                        });
+                        changed = true;
+                        _logger.LogInformation("Session {Id} → AutoCompleted (idle catch-all, Port {P}, {E} kWh)",
+                            session.Id, session.PortNumber, energy);
                     }
                 }
 
