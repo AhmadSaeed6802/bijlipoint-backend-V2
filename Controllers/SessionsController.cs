@@ -35,28 +35,24 @@ namespace BijliPoint.Controllers
             if (portBusy)
                 return BadRequest(new { error = "This port is already in use." });
 
+            // Block if a *different* rider already has a pending start on this port;
+            // same rider is allowed to retry (overwrites the pending below)
+            var pendingKey = $"pending:start:{request.StationId}:{request.PortNumber}";
+            if (_cache.TryGetValue(pendingKey, out PendingSessionData existingPending)
+                && existingPending.RiderId != request.RiderId)
+                return BadRequest(new { error = "This port has a session starting. Please wait." });
+
             var station = await _context.Stations.FindAsync(request.StationId);
             if (station == null)
                 return NotFound(new { error = "Station not found." });
 
-            // Snapshot current meter energy so we can calculate delta on stop
-            decimal energyAtStart = 0;
-            var cacheKey = $"meter:last:{request.StationId}:{request.PortNumber}";
-            if (_cache.TryGetValue(cacheKey, out MeterReading meterNow))
-                energyAtStart = meterNow.Energy;
-
-            var session = new ChargingSession
+            // Store pending — MqttService creates the DB session on first non-idle signal
+            _cache.Set(pendingKey, new PendingSessionData
             {
-                RiderId     = request.RiderId,
-                StationId   = request.StationId,
-                PortNumber  = request.PortNumber,
-                StartTime   = DateTime.UtcNow,
-                EnergyAtStart = energyAtStart,
-                UnitsConsumed = 0,
-                TotalCost   = 0,
-                Status      = "Active"
-            };
-            _context.ChargingSessions.Add(session);
+                RiderId   = request.RiderId,
+                StationId = request.StationId,
+                PortNumber = request.PortNumber,
+            }, TimeSpan.FromSeconds(35));
 
             // Queue ON command via MQTT
             _context.PortCommands.Add(new PortCommand
@@ -71,10 +67,11 @@ namespace BijliPoint.Controllers
 
             await _context.SaveChangesAsync();
 
-            return Ok(new { sessionId = session.Id, message = "Charging started." });
+            return Ok(new { status = "pending", message = "Hardware command sent. Waiting for signal." });
         }
 
         // POST: api/sessions/stop/{sessionId}
+        // Sends OFF command only — actual session end is confirmed when hardware goes idle.
         [HttpPost("stop/{sessionId}")]
         public async Task<IActionResult> StopSession(int sessionId)
         {
@@ -84,24 +81,6 @@ namespace BijliPoint.Controllers
             if (session.Status != "Active")
                 return BadRequest(new { error = "Session is not active." });
 
-            var station = await _context.Stations.FindAsync(session.StationId);
-
-            // Calculate units from meter delta
-            decimal currentEnergy = session.EnergyAtStart;
-            var cacheKey = $"meter:last:{session.StationId}:{session.PortNumber}";
-            if (_cache.TryGetValue(cacheKey, out MeterReading meterNow))
-                currentEnergy = meterNow.Energy;
-
-            // Guard against meter reset
-            decimal units = Math.Max(0, currentEnergy - session.EnergyAtStart);
-            decimal rate  = station?.RatePerKwh ?? 18m;
-
-            session.EndTime       = DateTime.UtcNow;
-            session.UnitsConsumed = units;
-            session.TotalCost     = Math.Round(units * rate, 2);
-            session.Status        = "Completed";
-
-            // Queue OFF command via MQTT
             _context.PortCommands.Add(new PortCommand
             {
                 StationId   = session.StationId,
@@ -114,17 +93,7 @@ namespace BijliPoint.Controllers
 
             await _context.SaveChangesAsync();
 
-            var duration = (session.EndTime.Value - session.StartTime).TotalMinutes;
-
-            return Ok(new
-            {
-                sessionId     = session.Id,
-                unitsConsumed = units,
-                totalCost     = session.TotalCost,
-                duration      = Math.Round(duration, 1),
-                ratePerKwh    = rate,
-                stationName   = station?.Name
-            });
+            return Ok(new { status = "stopping", message = "Stop command sent. Waiting for charger to idle." });
         }
 
         // GET: api/sessions/active/{riderId}

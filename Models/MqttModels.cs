@@ -19,6 +19,13 @@ namespace BijliPoint.Models
         public Station Station { get; set; }
     }
 
+    public class PendingSessionData
+    {
+        public int RiderId    { get; set; }
+        public int StationId  { get; set; }
+        public int PortNumber { get; set; }
+    }
+
     public class PortCommand
     {
         public int Id { get; set; }

@@ -54,6 +54,6 @@ namespace BijliPoint.Models
         public decimal UnitsConsumed { get; set; }
         public decimal TotalCost { get; set; }
         public string Status { get; set; } // Active, Completed, Cancelled
-        public string BreakerSessionId { get; set; }
+        public string? BreakerSessionId { get; set; }
     }
 }

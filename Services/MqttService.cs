@@ -191,31 +191,54 @@ namespace BijliPoint.Services
                 }
                 else
                 {
-                    // Charging detected with no active session → unauthorized protection.
-                    // Rate-limited to one OFF per minute per port to avoid command spam.
-                    var unauthKey = $"unauth:off:{station.Id}:{portNumber}";
-                    if (!_cache.TryGetValue(unauthKey, out _))
+                    // Non-idle: check if a rider clicked Start and is waiting for this signal
+                    var pendingKey = $"pending:start:{station.Id}:{portNumber}";
+                    if (_cache.TryGetValue(pendingKey, out PendingSessionData pending))
                     {
-                        bool hasSession = await context.ChargingSessions
-                            .AnyAsync(s => s.StationId == station.Id
-                                       && s.PortNumber == portNumber
-                                       && s.Status == "Active");
-
-                        if (!hasSession)
+                        _cache.Remove(pendingKey);
+                        context.ChargingSessions.Add(new ChargingSession
                         {
-                            _cache.Set(unauthKey, true, TimeSpan.FromMinutes(1));
-                            context.PortCommands.Add(new PortCommand
+                            RiderId       = pending.RiderId,
+                            StationId     = station.Id,
+                            PortNumber    = portNumber,
+                            StartTime     = DateTime.UtcNow,
+                            EnergyAtStart = reading.Energy,
+                            UnitsConsumed = 0,
+                            TotalCost     = 0,
+                            Status        = "Active"
+                        });
+                        needsSave = true;
+                        _logger.LogInformation("Session created from pending: Rider {R} Station {S} Port {P} @ {E} kWh",
+                            pending.RiderId, station.Id, portNumber, reading.Energy);
+                    }
+                    else
+                    {
+                        // Charging detected with no active session → unauthorized protection.
+                        // Rate-limited to one OFF per minute per port to avoid command spam.
+                        var unauthKey = $"unauth:off:{station.Id}:{portNumber}";
+                        if (!_cache.TryGetValue(unauthKey, out _))
+                        {
+                            bool hasSession = await context.ChargingSessions
+                                .AnyAsync(s => s.StationId == station.Id
+                                           && s.PortNumber == portNumber
+                                           && s.Status == "Active");
+
+                            if (!hasSession)
                             {
-                                StationId   = station.Id,
-                                PortNumber  = portNumber,
-                                Command     = "OFF",
-                                RequestedBy = 0,
-                                RequestedAt = DateTime.UtcNow,
-                                Status      = "Pending"
-                            });
-                            needsSave = true;
-                            _logger.LogWarning("Unauthorized charging: Station {SId} Port {P} → OFF queued",
-                                station.Id, portNumber);
+                                _cache.Set(unauthKey, true, TimeSpan.FromMinutes(1));
+                                context.PortCommands.Add(new PortCommand
+                                {
+                                    StationId   = station.Id,
+                                    PortNumber  = portNumber,
+                                    Command     = "OFF",
+                                    RequestedBy = 0,
+                                    RequestedAt = DateTime.UtcNow,
+                                    Status      = "Pending"
+                                });
+                                needsSave = true;
+                                _logger.LogWarning("Unauthorized charging: Station {SId} Port {P} → OFF queued",
+                                    station.Id, portNumber);
+                            }
                         }
                     }
                 }
@@ -311,8 +334,8 @@ namespace BijliPoint.Services
                     var cacheKey = $"meter:last:{session.StationId}:{session.PortNumber}";
                     _cache.TryGetValue(cacheKey, out MeterReading last);
 
-                    // ── Stale: no signal for > 5 minutes ──────────────────────────────
-                    if (last == null || (DateTime.UtcNow - last.ReceivedAt).TotalMinutes > 5)
+                    // ── Stale: no signal for > 2 minutes ──────────────────────────────
+                    if (last == null || (DateTime.UtcNow - last.ReceivedAt).TotalMinutes > 2)
                     {
                         var station = await context.Stations.FindAsync(session.StationId);
                         decimal energy = last != null ? Math.Max(0, last.Energy - session.EnergyAtStart) : 0;
@@ -330,7 +353,7 @@ namespace BijliPoint.Services
                             Status      = "Pending"
                         });
                         changed = true;
-                        _logger.LogWarning("Session {Id} → Timeout (no signal >5min)", session.Id);
+                        _logger.LogWarning("Session {Id} → Timeout (no signal >2min)", session.Id);
                         continue;
                     }
 
